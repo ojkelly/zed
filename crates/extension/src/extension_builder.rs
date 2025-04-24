@@ -235,6 +235,12 @@ impl ExtensionBuilder {
         let mut grammar_wasm_path = grammar_repo_dir.clone();
         grammar_wasm_path.set_extension("wasm");
 
+        if fs::metadata(&grammar_wasm_path).map_or(false, |m| m.is_file()) {
+            log::info!("grammar wasm already exists, skipping compilation");
+
+            return Ok(());
+        }
+
         log::info!("checking out {grammar_name} parser");
         self.checkout_repo(
             &grammar_repo_dir,
