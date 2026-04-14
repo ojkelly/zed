@@ -49,6 +49,8 @@ mod taffy;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test;
 mod text_system;
+#[cfg(feature = "snapshots")]
+mod snapshot;
 mod util;
 mod view;
 mod window;
@@ -118,6 +120,8 @@ pub use taffy::{AvailableSpace, LayoutId};
 #[cfg(any(test, feature = "test-support"))]
 pub use test::*;
 pub use text_system::*;
+#[cfg(feature = "snapshots")]
+pub use snapshot::*;
 pub use util::{FutureExt, Timeout};
 pub use view::*;
 pub use window::*;

@@ -17,6 +17,7 @@ test-support = ["gpui/test-support"]
 runtime_shaders = []
 font-kit = ["dep:font-kit"]
 screen-capture = ["gpui/screen-capture"]
+snapshots = ["gpui/snapshots"]
 
 [dependencies]
 gpui.workspace = true

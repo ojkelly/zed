@@ -17,7 +17,7 @@ use image::RgbaImage;
 use core_foundation::base::TCFType;
 use core_video::{
     metal_texture::CVMetalTextureGetTexture, metal_texture_cache::CVMetalTextureCache,
-    pixel_buffer::kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+    pixel_buffer::{kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, kCVPixelFormatType_32BGRA},
 };
 use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
@@ -125,6 +125,7 @@ pub(crate) struct MetalRenderer {
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    surfaces_bgra_pipeline_state: metal::RenderPipelineState,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -318,6 +319,14 @@ impl MetalRenderer {
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let surfaces_bgra_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "surfaces_bgra",
+            "surface_vertex",
+            "surface_bgra_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
 
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
@@ -340,6 +349,7 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            surfaces_bgra_pipeline_state,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -435,6 +445,93 @@ impl MetalRenderer {
 
     pub fn destroy(&self) {
         // nothing to do
+    }
+
+    /// Capture the contents of a texture as RGBA pixels.
+    /// Used for snapshot testing.
+    #[cfg(feature = "snapshots")]
+    pub fn read_texture(&self, texture: &metal::TextureRef) -> anyhow::Result<(u32, u32, Vec<u8>)> {
+        let width = texture.width() as u32;
+        let height = texture.height() as u32;
+
+        let bytes_per_row = width * 4;
+        let buffer_size = (bytes_per_row * height) as u64;
+        let buffer = self.device.new_buffer(
+            buffer_size,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        let command_buffer = self.command_queue.new_command_buffer();
+        let blit = command_buffer.new_blit_command_encoder();
+        blit.copy_from_texture_to_buffer(
+            texture,
+            0,
+            0,
+            metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            metal::MTLSize {
+                width: width as u64,
+                height: height as u64,
+                depth: 1,
+            },
+            &buffer,
+            0,
+            bytes_per_row as u64,
+            0,
+            metal::MTLBlitOption::None,
+        );
+        blit.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        let ptr = buffer.contents() as *const u8;
+        let slice = unsafe { std::slice::from_raw_parts(ptr, buffer_size as usize) };
+
+        let mut rgba = vec![0u8; buffer_size as usize];
+        for i in (0..buffer_size as usize).step_by(4) {
+            rgba[i] = slice[i + 2];
+            rgba[i + 1] = slice[i + 1];
+            rgba[i + 2] = slice[i];
+            rgba[i + 3] = slice[i + 3];
+        }
+
+        Ok((width, height, rgba))
+    }
+
+    /// Draw the scene and capture it as RGBA pixels before presenting.
+    #[cfg(feature = "snapshots")]
+    pub fn draw_and_snapshot(&mut self, scene: &Scene) -> anyhow::Result<(u32, u32, Vec<u8>)> {
+        let layer = self
+            .layer
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("draw_and_snapshot called on headless renderer"))?
+            .clone();
+        let viewport_size = layer.drawable_size();
+        let viewport_size: Size<DevicePixels> = size(
+            (viewport_size.width.ceil() as i32).into(),
+            (viewport_size.height.ceil() as i32).into(),
+        );
+        let drawable = layer
+            .next_drawable()
+            .ok_or_else(|| anyhow::anyhow!("failed to get drawable for snapshot"))?;
+
+        let mut instance_buffer = self
+            .instance_buffer_pool
+            .lock()
+            .acquire(&self.device, self.is_unified_memory);
+
+        let command_buffer =
+            self.draw_primitives(scene, &mut instance_buffer, drawable, viewport_size)?;
+
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        self.instance_buffer_pool.lock().release(instance_buffer);
+
+        let result = self.read_texture(drawable.texture());
+
+        drawable.present();
+
+        result
     }
 
     pub fn draw(&mut self, scene: &Scene) {
@@ -1389,6 +1486,46 @@ impl MetalRenderer {
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
+        for surface in surfaces {
+            let pixel_format = surface.image_buffer.get_pixel_format();
+
+            // Branch by pixel format: YUV for video, BGRA for 3D rendering
+            let result = if pixel_format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange {
+                self.draw_surface_yuv(
+                    surface,
+                    instance_buffer,
+                    instance_offset,
+                    viewport_size,
+                    command_encoder,
+                )
+            } else if pixel_format == kCVPixelFormatType_32BGRA {
+                self.draw_surface_bgra(
+                    surface,
+                    instance_buffer,
+                    instance_offset,
+                    viewport_size,
+                    command_encoder,
+                )
+            } else {
+                log::error!("Unsupported surface pixel format: {}", pixel_format);
+                return false;
+            };
+
+            if !result {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn draw_surface_yuv(
+        &mut self,
+        surface: &PaintSurface,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) -> bool {
         command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
         command_encoder.set_vertex_buffer(
             SurfaceInputIndex::Vertices as u64,
@@ -1401,82 +1538,162 @@ impl MetalRenderer {
             &viewport_size as *const Size<DevicePixels> as *const _,
         );
 
-        for surface in surfaces {
-            let texture_size = size(
-                DevicePixels::from(surface.image_buffer.get_width() as i32),
-                DevicePixels::from(surface.image_buffer.get_height() as i32),
-            );
+        let texture_size = size(
+            DevicePixels::from(surface.image_buffer.get_width() as i32),
+            DevicePixels::from(surface.image_buffer.get_height() as i32),
+        );
 
-            assert_eq!(
-                surface.image_buffer.get_pixel_format(),
-                kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-            );
-
-            let y_texture = self
-                .core_video_texture_cache
-                .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
-                    None,
-                    MTLPixelFormat::R8Unorm,
-                    surface.image_buffer.get_width_of_plane(0),
-                    surface.image_buffer.get_height_of_plane(0),
-                    0,
-                )
-                .unwrap();
-            let cb_cr_texture = self
-                .core_video_texture_cache
-                .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
-                    None,
-                    MTLPixelFormat::RG8Unorm,
-                    surface.image_buffer.get_width_of_plane(1),
-                    surface.image_buffer.get_height_of_plane(1),
-                    1,
-                )
-                .unwrap();
-
-            align_offset(instance_offset);
-            let next_offset = *instance_offset + mem::size_of::<Surface>();
-            if next_offset > instance_buffer.size {
+        let y_texture = match self.core_video_texture_cache.create_texture_from_image(
+            surface.image_buffer.as_concrete_TypeRef(),
+            None,
+            MTLPixelFormat::R8Unorm,
+            surface.image_buffer.get_width_of_plane(0),
+            surface.image_buffer.get_height_of_plane(0),
+            0,
+        ) {
+            Ok(texture) => texture,
+            Err(err) => {
+                log::error!("Failed to create Y texture: {:?}", err);
                 return false;
             }
-
-            command_encoder.set_vertex_buffer(
-                SurfaceInputIndex::Surfaces as u64,
-                Some(&instance_buffer.metal_buffer),
-                *instance_offset as u64,
-            );
-            command_encoder.set_vertex_bytes(
-                SurfaceInputIndex::TextureSize as u64,
-                mem::size_of_val(&texture_size) as u64,
-                &texture_size as *const Size<DevicePixels> as *const _,
-            );
-            // let y_texture = y_texture.get_texture().unwrap().
-            command_encoder.set_fragment_texture(SurfaceInputIndex::YTexture as u64, unsafe {
-                let texture = CVMetalTextureGetTexture(y_texture.as_concrete_TypeRef());
-                Some(metal::TextureRef::from_ptr(texture as *mut _))
-            });
-            command_encoder.set_fragment_texture(SurfaceInputIndex::CbCrTexture as u64, unsafe {
-                let texture = CVMetalTextureGetTexture(cb_cr_texture.as_concrete_TypeRef());
-                Some(metal::TextureRef::from_ptr(texture as *mut _))
-            });
-
-            unsafe {
-                let buffer_contents = (instance_buffer.metal_buffer.contents() as *mut u8)
-                    .add(*instance_offset)
-                    as *mut SurfaceBounds;
-                ptr::write(
-                    buffer_contents,
-                    SurfaceBounds {
-                        bounds: surface.bounds,
-                        content_mask: surface.content_mask.clone(),
-                    },
-                );
+        };
+        let cb_cr_texture = match self.core_video_texture_cache.create_texture_from_image(
+            surface.image_buffer.as_concrete_TypeRef(),
+            None,
+            MTLPixelFormat::RG8Unorm,
+            surface.image_buffer.get_width_of_plane(1),
+            surface.image_buffer.get_height_of_plane(1),
+            1,
+        ) {
+            Ok(texture) => texture,
+            Err(err) => {
+                log::error!("Failed to create CbCr texture: {:?}", err);
+                return false;
             }
+        };
 
-            command_encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 6);
-            *instance_offset = next_offset;
+        align_offset(instance_offset);
+        let next_offset = *instance_offset + mem::size_of::<Surface>();
+        if next_offset > instance_buffer.size {
+            return false;
         }
+
+        command_encoder.set_vertex_buffer(
+            SurfaceInputIndex::Surfaces as u64,
+            Some(&instance_buffer.metal_buffer),
+            *instance_offset as u64,
+        );
+        command_encoder.set_vertex_bytes(
+            SurfaceInputIndex::TextureSize as u64,
+            mem::size_of_val(&texture_size) as u64,
+            &texture_size as *const Size<DevicePixels> as *const _,
+        );
+        command_encoder.set_fragment_texture(SurfaceInputIndex::YTexture as u64, unsafe {
+            let texture = CVMetalTextureGetTexture(y_texture.as_concrete_TypeRef());
+            Some(metal::TextureRef::from_ptr(texture as *mut _))
+        });
+        command_encoder.set_fragment_texture(SurfaceInputIndex::CbCrTexture as u64, unsafe {
+            let texture = CVMetalTextureGetTexture(cb_cr_texture.as_concrete_TypeRef());
+            Some(metal::TextureRef::from_ptr(texture as *mut _))
+        });
+
+        unsafe {
+            let buffer_contents = (instance_buffer.metal_buffer.contents() as *mut u8)
+                .add(*instance_offset)
+                as *mut SurfaceBounds;
+            ptr::write(
+                buffer_contents,
+                SurfaceBounds {
+                    bounds: surface.bounds,
+                    content_mask: surface.content_mask.clone(),
+                },
+            );
+        }
+
+        command_encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 6);
+        *instance_offset = next_offset;
+        true
+    }
+
+    fn draw_surface_bgra(
+        &mut self,
+        surface: &PaintSurface,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) -> bool {
+        command_encoder.set_render_pipeline_state(&self.surfaces_bgra_pipeline_state);
+        command_encoder.set_vertex_buffer(
+            SurfaceInputIndex::Vertices as u64,
+            Some(&self.unit_vertices),
+            0,
+        );
+        command_encoder.set_vertex_bytes(
+            SurfaceInputIndex::ViewportSize as u64,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const Size<DevicePixels> as *const _,
+        );
+
+        let texture_size = size(
+            DevicePixels::from(surface.image_buffer.get_width() as i32),
+            DevicePixels::from(surface.image_buffer.get_height() as i32),
+        );
+
+        // Create Metal texture from CVPixelBuffer (single BGRA plane)
+        let bgra_texture = match self.core_video_texture_cache.create_texture_from_image(
+            surface.image_buffer.as_concrete_TypeRef(),
+            None,
+            MTLPixelFormat::BGRA8Unorm,
+            surface.image_buffer.get_width(),
+            surface.image_buffer.get_height(),
+            0,
+        ) {
+            Ok(texture) => texture,
+            Err(err) => {
+                log::error!("Failed to create BGRA texture: {:?}", err);
+                return false;
+            }
+        };
+
+        align_offset(instance_offset);
+        let next_offset = *instance_offset + mem::size_of::<Surface>();
+        if next_offset > instance_buffer.size {
+            return false;
+        }
+
+        command_encoder.set_vertex_buffer(
+            SurfaceInputIndex::Surfaces as u64,
+            Some(&instance_buffer.metal_buffer),
+            *instance_offset as u64,
+        );
+        command_encoder.set_vertex_bytes(
+            SurfaceInputIndex::TextureSize as u64,
+            mem::size_of_val(&texture_size) as u64,
+            &texture_size as *const Size<DevicePixels> as *const _,
+        );
+
+        // Set BGRA texture (uses same texture slot as Y texture)
+        command_encoder.set_fragment_texture(SurfaceInputIndex::YTexture as u64, unsafe {
+            let texture = CVMetalTextureGetTexture(bgra_texture.as_concrete_TypeRef());
+            Some(metal::TextureRef::from_ptr(texture as *mut _))
+        });
+
+        unsafe {
+            let buffer_contents = (instance_buffer.metal_buffer.contents() as *mut u8)
+                .add(*instance_offset)
+                as *mut SurfaceBounds;
+            ptr::write(
+                buffer_contents,
+                SurfaceBounds {
+                    bounds: surface.bounds,
+                    content_mask: surface.content_mask.clone(),
+                },
+            );
+        }
+
+        command_encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 6);
+        *instance_offset = next_offset;
         true
     }
 }

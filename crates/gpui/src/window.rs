@@ -2367,6 +2367,51 @@ impl Window {
         profiling::finish_frame!();
     }
 
+    /// Capture the current rendered frame as RGBA pixels.
+    /// Returns (width, height, rgba_pixels).
+    /// This is useful for visual snapshot testing.
+    #[cfg(feature = "snapshots")]
+    pub fn snapshot(&self) -> anyhow::Result<(u32, u32, Vec<u8>)> {
+        self.platform_window.snapshot(&self.rendered_frame.scene)
+    }
+
+    /// Capture the current rendered frame and save it as a PNG file.
+    /// Creates the directory if it doesn't exist.
+    /// Returns the full path to the saved file.
+    #[cfg(feature = "snapshots")]
+    pub fn save_snapshot(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        use anyhow::Context;
+
+        let path = path.as_ref();
+
+        // Create parent directory if needed
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("Failed to create directory: {:?}", parent))?;
+            }
+        }
+
+        let (width, height, rgba_data) = self.snapshot()?;
+
+        image::save_buffer(path, &rgba_data, width, height, image::ColorType::Rgba8)
+            .with_context(|| format!("Failed to save snapshot to {:?}", path))?;
+
+        Ok(path.to_path_buf())
+    }
+
+    /// Capture the current rendered frame and save it to `.snapshots/{name}.png`.
+    /// Creates the `.snapshots` directory if it doesn't exist.
+    /// Returns the full path to the saved file.
+    #[cfg(feature = "snapshots")]
+    pub fn take_snapshot(&self, name: impl AsRef<str>) -> anyhow::Result<std::path::PathBuf> {
+        let path = format!(".snapshots/{}.png", name.as_ref());
+        self.save_snapshot(&path)
+    }
+
     fn draw_roots(&mut self, cx: &mut App) {
         self.invalidator.set_phase(DrawPhase::Prepaint);
         self.tooltip_bounds.take();
@@ -5391,6 +5436,18 @@ impl<V: 'static + Render> WindowHandle<V> {
     pub fn is_active(&self, cx: &mut App) -> Option<bool> {
         cx.update_window(self.any_handle, |_, window, _| window.is_window_active())
             .ok()
+    }
+
+    /// Capture the current rendered frame and save it to `.snapshots/{name}.png`.
+    /// Creates the `.snapshots` directory if it doesn't exist.
+    /// Returns the full path to the saved file.
+    #[cfg(feature = "snapshots")]
+    pub fn take_snapshot<C>(&self, cx: &mut C, name: impl AsRef<str>) -> Result<std::path::PathBuf>
+    where
+        C: AppContext,
+    {
+        let name = name.as_ref().to_string();
+        cx.update_window(self.any_handle, |_, window, _| window.take_snapshot(&name))?
     }
 }
 

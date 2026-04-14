@@ -1593,6 +1593,12 @@ impl PlatformWindow for MacWindow {
         this.renderer.draw(scene);
     }
 
+    #[cfg(feature = "snapshots")]
+    fn snapshot(&self, scene: &gpui::Scene) -> anyhow::Result<(u32, u32, Vec<u8>)> {
+        let mut this = self.0.lock();
+        this.renderer.draw_and_snapshot(scene)
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.0.lock().renderer.sprite_atlas().clone()
     }

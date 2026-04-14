@@ -640,6 +640,13 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;
 
+    /// Capture the current window contents as RGBA pixels.
+    /// Returns (width, height, rgba_pixels).
+    #[cfg(feature = "snapshots")]
+    fn snapshot(&self, _scene: &Scene) -> anyhow::Result<(u32, u32, Vec<u8>)> {
+        anyhow::bail!("Snapshots not supported on this platform")
+    }
+
     // macOS specific methods
     fn get_title(&self) -> String {
         String::new()
