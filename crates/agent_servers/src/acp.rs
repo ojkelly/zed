@@ -41,6 +41,7 @@ use acp_thread::{AcpThread, AuthRequired, LoadError, TerminalProviderEvent};
 use terminal::TerminalBuilder;
 use terminal::terminal_settings::{AlternateScroll, CursorShape};
 
+use crate::lsp_proxy;
 use crate::{CURSOR_ID, GEMINI_ID};
 
 pub const GEMINI_TERMINAL_AUTH_METHOD_ID: &str = "spawn-gemini-cli";
@@ -743,6 +744,14 @@ fn connect_client_future(
             on_request!(handle_create_elicitation),
             agent_client_protocol::on_receive_request!(),
         )
+        .on_receive_request(
+            on_request!(handle_list_language_servers),
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            on_request!(handle_language_server_request),
+            agent_client_protocol::on_receive_request!(),
+        )
         // --- Notification handlers (agent→client) ---
         .on_receive_notification(
             on_notification!(handle_session_notification),
@@ -773,6 +782,8 @@ fn client_capabilities_for_agent(agent_id: &AgentId) -> acp::ClientCapabilities 
     if agent_id.as_ref() == CURSOR_ID {
         meta.insert(PARAMETERIZED_MODEL_PICKER_META_KEY.into(), true.into());
     }
+
+    meta.insert(lsp_proxy::CAPABILITY_KEY.into(), true.into());
 
     acp::ClientCapabilities::new()
         .fs(acp::FileSystemCapabilities::new()
@@ -4809,6 +4820,55 @@ fn handle_read_text_file(
             .await;
 
         respond_result(responder, result.map(acp::ReadTextFileResponse::new));
+    })
+    .detach();
+}
+
+fn handle_list_language_servers(
+    args: lsp_proxy::ListServersRequest,
+    responder: Responder<lsp_proxy::ListServersResponse>,
+    cx: &mut AsyncApp,
+    ctx: &ClientContext,
+) {
+    let thread = match session_thread(ctx, &args.session_id) {
+        Ok(thread) => thread,
+        Err(err) => return respond_err(responder, err),
+    };
+
+    let result = thread
+        .read_with(cx, |thread, cx| {
+            lsp_proxy::list_servers(thread.project(), cx)
+        })
+        .map_err(|err| acp::Error::internal_error().data(err.to_string()));
+
+    respond_result(responder, result);
+}
+
+fn handle_language_server_request(
+    args: lsp_proxy::SendRequestRequest,
+    responder: Responder<lsp_proxy::SendRequestResponse>,
+    cx: &mut AsyncApp,
+    ctx: &ClientContext,
+) {
+    let thread = match session_thread(ctx, &args.session_id) {
+        Ok(thread) => thread,
+        Err(err) => return respond_err(responder, err),
+    };
+
+    let project = match thread.read_with(cx, |thread, _| thread.project().clone()) {
+        Ok(project) => project,
+        Err(err) => {
+            return respond_err(responder, acp::Error::internal_error().data(err.to_string()));
+        }
+    };
+
+    cx.spawn(async move |cx| {
+        let cancellation = responder.cancellation();
+        let result = cancellation
+            .run_until_cancelled(lsp_proxy::send_request(project, args, cx))
+            .await;
+
+        respond_result(responder, result);
     })
     .detach();
 }
