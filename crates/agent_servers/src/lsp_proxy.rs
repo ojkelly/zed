@@ -18,7 +18,7 @@ use gpui::{App, AsyncApp, Entity};
 use lsp::{
     DEFAULT_LSP_REQUEST_TIMEOUT, LanguageServer, request::Request as LspRequest,
 };
-use project::Project;
+use project::{Project, WorktreeId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -26,8 +26,10 @@ use std::{
     sync::Arc,
 };
 
-/// Key set to `true` in the client capabilities `_meta`, so agents can detect the
-/// extension before calling it.
+/// Key holding the extension's capability object in the client capabilities
+/// `_meta`, so agents can detect the extension before calling it. Absent or
+/// `null` means unsupported; any object, including an empty one, means
+/// supported — the same convention ACP uses for `elicitation`.
 pub const CAPABILITY_KEY: &str = "lsp";
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
@@ -50,8 +52,11 @@ pub struct ListServersResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LanguageServerInfo {
-    /// Identifies the server for `_zed.dev/lsp/request`, together with
-    /// `workspacePath` when a project runs more than one server of this name.
+    /// Identifies this server for `_zed.dev/lsp/request`. Opaque: callers must
+    /// not parse it. Stable across a restart of this same server, since it is
+    /// derived from `name` and `workspacePath`, neither of which changes when a
+    /// server restarts.
+    pub server_id: String,
     pub name: String,
     pub state: LanguageServerState,
     /// Root of the workspace this server was started for, distinguishing servers
@@ -82,13 +87,15 @@ pub struct LanguageServerInfo {
 pub enum LanguageServerState {
     /// Initialized, with a process behind it, and able to answer requests.
     Running,
-    /// Known to the project but not answering requests.
-    ///
-    /// Local servers never reach this: the project records a server's status only
-    /// once it finishes starting, and drops that record when it stops, so one that
-    /// is starting, stopped or restarting is absent from the listing rather than
-    /// listed as this. That leaves servers owned by the host of a remote or
-    /// collaborative project, which cannot be forwarded to.
+    /// Spawned but not yet initialized. `_zed.dev/lsp/request` against this
+    /// `serverId` fails until the server finishes starting; the id remains valid
+    /// once it does, since it does not change across that transition.
+    Starting,
+    /// Known to the project but not answering requests, and not `starting`: a
+    /// server owned by the host of a remote or collaborative project, which
+    /// cannot be forwarded to. A local server that has merely stopped is absent
+    /// from the listing rather than appearing here; a local restart passes back
+    /// through `Starting` once the new process spawns.
     NotRunning,
 }
 
@@ -97,13 +104,8 @@ pub enum LanguageServerState {
 #[serde(rename_all = "camelCase")]
 pub struct SendRequestRequest {
     pub session_id: acp::SessionId,
-    /// A `name` from `_zed.dev/lsp/servers`, such as `rust-analyzer`.
-    pub server_name: String,
-    /// The `workspacePath` of the intended entry in `_zed.dev/lsp/servers`.
-    ///
-    /// Required, because a name alone is ambiguous: a project with more than one
-    /// worktree of the same language runs one server per worktree.
-    pub workspace_path: PathBuf,
+    /// A `serverId` from `_zed.dev/lsp/servers`.
+    pub server_id: String,
     /// An LSP client-to-server method name, such as `textDocument/hover`.
     pub method: String,
     #[serde(default)]
@@ -114,7 +116,7 @@ pub struct SendRequestRequest {
 #[serde(rename_all = "camelCase")]
 pub struct SendRequestResponse {
     /// The server's result, deserialized and re-serialized but not reshaped.
-    pub result: Value,
+    pub lsp_result: Value,
 }
 
 /// Generates the forwarding table from `lsp_types` request types.
@@ -279,18 +281,31 @@ mod tests {
     }
 }
 
+/// Mints the opaque, restart-stable id addressing a server in
+/// `_zed.dev/lsp/request`.
+///
+/// Callers must treat this as opaque and never parse it; it happens to be
+/// derived deterministically from `name` and `workspace_path`, joined on a NUL
+/// byte (which cannot appear in either), purely so this side can recompute and
+/// match it without maintaining a separate id table. It is stable across a
+/// restart because neither `name` nor `workspace_path` changes when a server
+/// restarts.
+fn make_server_id(name: &str, workspace_path: &Path) -> String {
+    format!("{name}\0{}", workspace_path.display())
+}
+
 pub fn list_servers(project: &Entity<Project>, cx: &App) -> ListServersResponse {
     let project = project.read(cx);
     let lsp_store = project.lsp_store().read(cx);
 
-    let servers = lsp_store
+    let running = lsp_store
         .language_server_statuses()
         // A server with no workspace is one the host of a remote or collaborative
         // project owns. It cannot be addressed, so listing it would only offer the
         // agent a server every request against it would reject.
         .filter_map(|(server_id, status)| {
-            let workspace_path = server_workspace_path(project, status, cx)?;
-            let running = lsp_store.language_server_for_id(server_id).is_some();
+            let workspace_path = server_workspace_path(project, status.worktree, cx)?;
+            let is_running = lsp_store.language_server_for_id(server_id).is_some();
             let language = status.language_name.as_ref().and_then(|language_name| {
                 project
                     .languages()
@@ -299,8 +314,9 @@ pub fn list_servers(project: &Entity<Project>, cx: &App) -> ListServersResponse 
                     .find(|language| &language.name() == language_name)
             });
             Some(LanguageServerInfo {
+                server_id: make_server_id(&status.name.0, &workspace_path),
                 name: status.name.to_string(),
-                state: if running {
+                state: if is_running {
                     LanguageServerState::Running
                 } else {
                     LanguageServerState::NotRunning
@@ -325,8 +341,28 @@ pub fn list_servers(project: &Entity<Project>, cx: &App) -> ListServersResponse 
                     .get(&server_id)
                     .and_then(|capabilities| serde_json::to_value(capabilities).ok()),
             })
-        })
-        .collect();
+        });
+
+    let starting = lsp_store
+        .starting_language_servers()
+        .into_iter()
+        .filter_map(|(_server_id, name, worktree_id)| {
+            let workspace_path = server_workspace_path(project, Some(worktree_id), cx)?;
+            Some(LanguageServerInfo {
+                server_id: make_server_id(&name.0, &workspace_path),
+                name: name.to_string(),
+                state: LanguageServerState::Starting,
+                workspace_path,
+                // Not yet known: the language and its adapter aren't resolved
+                // until the server finishes starting.
+                file_extensions: Vec::new(),
+                language_id: None,
+                version: None,
+                capabilities: None,
+            })
+        });
+
+    let servers = running.chain(starting).collect();
 
     ListServersResponse {
         servers,
@@ -347,54 +383,60 @@ pub async fn send_request(
     // buffer with its servers only while something holds it open.
     let _open_buffer = open_referenced_buffer(&project, &request.params, cx).await?;
 
-    let server = project.update(cx, |project, cx| {
-        resolve_server(project, &request.server_name, &request.workspace_path, cx)
-    })?;
+    let server = project.update(cx, |project, cx| resolve_server(project, &request.server_id, cx))?;
 
-    let result = forward(server, &request.method, request.params).await?;
-    Ok(SendRequestResponse { result })
+    let lsp_result = forward(server, &request.method, request.params).await?;
+    Ok(SendRequestResponse { lsp_result })
 }
 
-/// Finds the running server identified by `name` and `workspace_path`.
+/// Finds the running server whose minted id matches `server_id`.
 ///
-/// Servers are addressed by that pair rather than by Zed's internal id, which does
-/// not survive a server restart, and by more than a name, which is ambiguous when a
-/// project has several worktrees of the same language.
+/// The id is never parsed back apart — every candidate server's id is
+/// recomputed from its own `(name, workspace_path)` and compared, so this side
+/// never has to trust or decode caller-supplied structure, only equality.
 fn resolve_server(
     project: &Project,
-    name: &str,
-    workspace_path: &Path,
+    server_id: &str,
     cx: &App,
 ) -> Result<Arc<LanguageServer>, acp::Error> {
     let lsp_store = project.lsp_store().read(cx);
 
-    lsp_store
-        .language_server_statuses()
-        .filter(|(_, status)| status.name.0 == name)
-        .find_map(|(server_id, status)| {
-            if server_workspace_path(project, status, cx).as_deref() != Some(workspace_path) {
-                return None;
-            }
-            lsp_store.language_server_for_id(server_id)
-        })
-        .ok_or_else(|| {
-            acp::Error::invalid_params().data(format!(
-                "no running language server named {name} for workspace {}; \
-                 call _zed.dev/lsp/servers for the current set",
-                workspace_path.display()
-            ))
-        })
+    let running = lsp_store.language_server_statuses().find_map(|(id, status)| {
+        let workspace_path = server_workspace_path(project, status.worktree, cx)?;
+        (make_server_id(&status.name.0, &workspace_path) == server_id)
+            .then(|| lsp_store.language_server_for_id(id))
+            .flatten()
+    });
+    if let Some(server) = running {
+        return Ok(server);
+    }
+
+    let starting = lsp_store
+        .starting_language_servers()
+        .into_iter()
+        .find(|(_, name, worktree_id)| {
+            server_workspace_path(project, Some(*worktree_id), cx)
+                .is_some_and(|workspace_path| make_server_id(&name.0, &workspace_path) == server_id)
+        });
+    if starting.is_some() {
+        return Err(acp::Error::invalid_params().data(
+            "language server is still starting; retry once _zed.dev/lsp/servers reports it running",
+        ));
+    }
+
+    Err(acp::Error::invalid_params().data(format!(
+        "no language server with id {server_id:?}; call _zed.dev/lsp/servers for the current set"
+    )))
 }
 
 fn server_workspace_path(
     project: &Project,
-    status: &project::LanguageServerStatus,
+    worktree_id: Option<WorktreeId>,
     cx: &App,
 ) -> Option<PathBuf> {
-    let worktree_id = status.worktree?;
     Some(
         project
-            .worktree_for_id(worktree_id, cx)?
+            .worktree_for_id(worktree_id?, cx)?
             .read(cx)
             .abs_path()
             .to_path_buf(),

@@ -783,7 +783,10 @@ fn client_capabilities_for_agent(agent_id: &AgentId) -> acp::ClientCapabilities 
         meta.insert(PARAMETERIZED_MODEL_PICKER_META_KEY.into(), true.into());
     }
 
-    meta.insert(lsp_proxy::CAPABILITY_KEY.into(), true.into());
+    meta.insert(
+        lsp_proxy::CAPABILITY_KEY.into(),
+        serde_json::json!({}),
+    );
 
     acp::ClientCapabilities::new()
         .fs(acp::FileSystemCapabilities::new()

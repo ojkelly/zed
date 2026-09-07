@@ -11087,6 +11087,31 @@ impl LspStore {
         self.as_local()?.language_server_for_id(id)
     }
 
+    /// Language servers that are still starting: known to the project, but with
+    /// no process behind them yet and no [`LanguageServerStatus`] entry, since
+    /// that entry is only created once startup finishes.
+    ///
+    /// Local projects only — a remote or collaborative project's host tracks its
+    /// own servers' startup, which isn't relayed to guests.
+    pub fn starting_language_servers(
+        &self,
+    ) -> Vec<(LanguageServerId, LanguageServerName, WorktreeId)> {
+        let Some(local) = self.as_local() else {
+            return Vec::new();
+        };
+        local
+            .language_server_ids
+            .iter()
+            .filter(|(_, unified)| {
+                matches!(
+                    local.language_servers.get(&unified.id),
+                    Some(LanguageServerState::Starting { .. })
+                )
+            })
+            .map(|(seed, unified)| (unified.id, seed.name.clone(), seed.worktree_id))
+            .collect()
+    }
+
     fn on_lsp_progress(
         &mut self,
         progress_params: lsp::ProgressParams,
