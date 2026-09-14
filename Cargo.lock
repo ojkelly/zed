@@ -391,6 +391,7 @@ dependencies = [
  "indoc",
  "language_model",
  "log",
+ "lsp",
  "project",
  "release_channel",
  "remote",
